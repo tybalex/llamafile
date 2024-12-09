@@ -3449,30 +3449,54 @@ int server_cli(int argc, char **argv)
                     }
                     llama.queue_results.remove_waiting_task_id(task_id);
                 } else {
-                    const auto chunked_content_provider = [task_id, &llama](size_t, httplib::DataSink &sink) {
-                        while (true) {
-                            task_result llama_result = llama.queue_results.recv(task_id);
-                            if (!llama_result.error) {
-                                std::vector<json> result_array = format_partial_response_oaicompat( llama_result);
+                    const auto chunked_content_provider = [task_id, &llama, &data](size_t, httplib::DataSink &sink) {
 
-                                for (auto it = result_array.begin(); it != result_array.end(); ++it)
-                                {
-                                    if (!it->empty()) {
-                                        const std::string str =
-                                            "data: " +
-                                            it->dump(-1, ' ', false, json::error_handler_t::replace) +
-                                            "\n\n";
-                                        LOG_VERBOSE("data stream", {{"to_send", str}});
-                                        if (!sink.write(str.c_str(), str.size())) {
-                                            llama.queue_results.remove_waiting_task_id(task_id);
-                                            return false;
-                                        }
+                        auto result_handler = [&sink, &llama, &task_id](const task_result& llama_result) -> bool {
+                            std::vector<json> result_array = format_partial_response_oaicompat( llama_result);
+                            for (auto it = result_array.begin(); it != result_array.end(); ++it)
+                                if (!it->empty()) {
+                                    const std::string str =
+                                        "data: " +
+                                        it->dump(-1, ' ', false, json::error_handler_t::replace) +
+                                        "\n\n";
+                                    LOG_VERBOSE("data stream", {{"to_send", str}});
+                                    
+                                    if (!sink.write(str.c_str(), str.size())) {
+                                        llama.queue_results.remove_waiting_task_id(task_id);
+                                        return false;
                                     }
                                 }
-                                if (llama_result.stop) {
+                            return true;
+                        };
+                        // TODO: this is a hack to get the function call to work    
+                        std::string last_str = "";
+                        bool is_function_call = false;
+                        bool checked_function_call = false;
+                        json last_result_data;
+                        while (true) {
+                            task_result llama_result = llama.queue_results.recv(task_id);
+                            
+                            if (data.contains("tool_field")) {
+                                llama_result.result_json["tool_field"] = data["tool_field"];
+                            }
+                            std::string content = llama_result.result_json.value("content", "");
+                            if (!is_function_call) {
+                                std::string str_to_check = last_str + content;
+                                is_function_call = (str_to_check.find("starttool") != std::string::npos);
+                            }
+                            if (!is_function_call && !last_str.empty()) {
+                                std::string temp_str = content;
+                                llama_result.result_json["content"] = last_str;
+                                last_str = temp_str;
+                                if (!result_handler(llama_result)) {
+                                    llama.request_cancel(task_id);
                                     break;
                                 }
                             } else {
+                                last_str += content;
+                            }
+
+                            if (llama_result.error) {
                                 const std::string str =
                                     "error: " +
                                     llama_result.result_json.dump(-1, ' ', false,
@@ -3485,6 +3509,23 @@ int server_cli(int argc, char **argv)
                                 }
                                 break;
                             }
+
+                            if (llama_result.stop) {
+                                if (!last_str.empty()) {
+                                    last_result_data["content"] = last_str;
+                                    task_result temp_result = llama_result;
+                                    temp_result.result_json = last_result_data;
+                                    if (!result_handler(temp_result)) {
+                                        llama.request_cancel(task_id);
+                                        break;
+                                    }
+                                }
+                                if (!result_handler(llama_result)) {
+                                    llama.request_cancel(task_id);
+                                    break;
+                                }
+                            }
+                            last_result_data = llama_result.result_json;
                         }
                         sink.done();
                         llama.queue_results.remove_waiting_task_id(task_id);

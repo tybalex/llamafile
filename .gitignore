@@ -10,3 +10,12 @@
 /trace.json
 
 /*.log
+
+*gguf
+*DS_Store
+
+*.llamafile
+*node_modules
+*package.json
+*package-lock.json
+*.vscode
